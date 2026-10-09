@@ -1,4 +1,4 @@
-# hash:sha256:7cce7b22f0ff6e0a3797e0a806f0ce2bc2baa5339d752050b55fd6f414e86fcb
+# hash:sha256:b0985816fa3f40da286c65ca6edf590672272d8fbef5dc66d4295ae7a7569d87
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/mambaforge3:24.5.0-0-python3.12.4-ubuntu22.04
 
