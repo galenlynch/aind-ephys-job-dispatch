@@ -31,6 +31,34 @@ try:
 except ImportError:
     HAVE_AIND_LOG_UTILS = False
 
+try:
+    import wavpack_numcodecs  # noqa: F401
+except ImportError:
+    import numcodecs
+    from numcodecs.abc import Codec
+
+    class UndecodableWavPack(Codec):
+        """Stands in for the WavPack codec, which zarr resolves on opening an array even if no chunk is read.
+
+        Job dispatch reads only zarr metadata and timestamps, never the WavPack-compressed traces.
+        """
+
+        codec_id = "wavpack"
+
+        def __init__(self, **config):
+            self.config = config
+
+        def get_config(self):
+            return {"id": self.codec_id, **self.config}
+
+        def encode(self, buf):
+            raise RuntimeError("wavpack-numcodecs is not installed; job dispatch cannot write traces")
+
+        def decode(self, buf, out=None):
+            raise RuntimeError("wavpack-numcodecs is not installed; job dispatch cannot read traces")
+
+    numcodecs.register_codec(UndecodableWavPack)
+
 
 # here we define some constants used for defining if timestamps are ok
 # or should be skipped
