@@ -1,4 +1,4 @@
-# hash:sha256:9ea52d8d7fcb2300ea8a13d773cafab22c128e5ed642e9662d88ff8d1c533356
+# hash:sha256:0fca3f034e573b9621dca52296cc5ee29a686e8a10df89f2133f98e7157e408b
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/python-slim-uv:main-5692e50
 
@@ -8,7 +8,7 @@ COPY git-ask-pass /
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        procps \
+        procps=2:4.0.4-9 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY postInstall /
