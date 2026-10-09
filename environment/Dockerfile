@@ -15,5 +15,7 @@ RUN pip install -U --no-cache-dir \
     aind-log-utils==0.2.3 \
     hdmf-zarr==0.13.0 \
     pynwb==3.1.3 \
+    s3fs==2025.5.1 \
     spikeinterface==0.104.7 \
+    universal-pathlib==0.3.10 \
     wavpack-numcodecs==0.2.2

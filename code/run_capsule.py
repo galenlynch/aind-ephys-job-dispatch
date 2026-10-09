@@ -11,6 +11,8 @@ import warnings
 from pathlib import Path
 import json
 import logging
+import re
+import tempfile
 
 
 # SPIKEINTERFACE
@@ -20,6 +22,7 @@ import spikeinterface.extractors as se
 from spikeinterface.core.core_tools import SIJsonEncoder
 
 import probeinterface as pi
+from upath import UPath
 
 try:
     from aind_log_utils import log
@@ -38,6 +41,8 @@ MAX_PERCENT_ZERO_TIMESTAMPS_DIFF = 0.02  # percent of zero timestamps diff allow
 
 
 data_folder = Path("../data")
+# where downstream capsules find a session read from --ecephys-url: job JSONs are written as if it were staged here
+STAGED_SESSION_NAME = "ecephys_session"
 results_folder = Path("../results")
 
 
@@ -136,7 +141,61 @@ spikeinterface_info_group.add_argument(
     help=spikeinterface_info_help,
 )
 
+ecephys_url_help = (
+    "Comma-separated URLs (e.g. s3://bucket/session) of AIND sessions to read in place instead of the data folder. "
+    "Only used if `input='aind'`."
+)
+parser.add_argument("--ecephys-url", default=None, help=ecephys_url_help)
+
 parser.add_argument("--params", default=None, help="Path to the parameters file or JSON string. If given, it will override all other arguments.")
+
+
+def read_openephys_probe(settings_file: Path | UPath, stream_name: str) -> pi.Probe:
+    """Read a probe from an Open Ephys settings file; probeinterface only reads local files, so remote ones are copied."""
+    if isinstance(settings_file, Path):
+        return pi.read_openephys(settings_file, stream_name=stream_name)
+    with tempfile.TemporaryDirectory() as tmp:
+        local_settings_file = Path(tmp) / settings_file.name
+        local_settings_file.write_bytes(settings_file.read_bytes())
+        return pi.read_openephys(local_settings_file, stream_name=stream_name)
+
+
+def open_remote_session(url: str) -> UPath:
+    """Open a session URL unsigned if it is public-read, else with the environment's credentials.
+
+    Unsigned is tried first because a stale AWS profile fails before s3fs falls back to unsigned access.
+    """
+    url = url.rstrip("/")
+    try:
+        session = UPath(url, anon=True)
+        (session / "data_description.json").exists()
+        return session
+    except PermissionError:
+        return UPath(url)
+
+
+def as_staged(obj, session_url: str):
+    """Rewrite paths under `session_url` to the session's staged location, relative to the data folder."""
+    if isinstance(obj, dict):
+        return {key: as_staged(value, session_url) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [as_staged(value, session_url) for value in obj]
+    if isinstance(obj, str) and obj.startswith(f"{session_url}/"):
+        return STAGED_SESSION_NAME + obj[len(session_url) :]
+    return obj
+
+
+def to_staged_dict(recording: si.BaseRecording, session_url: str, include_annotations: bool = False) -> dict:
+    """Serialize a recording read from `session_url` exactly as if it had been read from the staged session."""
+    recording_dict = as_staged(
+        recording.to_dict(recursive=True, include_annotations=include_annotations, relative_to=None), session_url
+    )
+    unstaged = re.findall(r'"([a-z0-9]+://[^"]*)"', json.dumps(recording_dict, cls=SIJsonEncoder))
+    if unstaged:
+        raise ValueError(f"Paths outside {session_url} cannot be staged: {unstaged[:3]}")
+    recording_dict["relative_paths"] = True
+    return recording_dict
+
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -170,6 +229,7 @@ if __name__ == "__main__":
             assert spikeinterface_info is not None, "SpikeInterface info is required when using the spikeinterface loader"
         MULTI_SESSION = params.get("multi_session", False)
         MIN_RECORDING_DURATION = params.get("min_recording_duration", -1)
+        ECEPHYS_URLS = params.get("ecephys_url")
     else:
         # if params is not given, use the arguments
         SPLIT_SEGMENTS = (
@@ -201,15 +261,21 @@ if __name__ == "__main__":
             spikeinterface_info = args.static_spikeinterface_info or args.spikeinterface_info
             assert spikeinterface_info is not None, "SpikeInterface info is required when using the spikeinterface loader"
         MIN_RECORDING_DURATION = float(args.static_min_recording_duration or args.min_recording_duration)
+        ECEPHYS_URLS = args.ecephys_url
+    if isinstance(ECEPHYS_URLS, str):
+        ECEPHYS_URLS = [url for url in ECEPHYS_URLS.split(",") if url]
 
     # setup AIND logging before any other logging call
     aind_log_setup = False
 
     ecephys_session_folders = None
     if INPUT == "aind":
-        ecephys_session_folders = [
-            p for p in data_folder.iterdir() if "ecephys" in p.name.lower() or "behavior" in p.name.lower()
-        ]
+        if ECEPHYS_URLS:
+            ecephys_session_folders = [open_remote_session(url) for url in ECEPHYS_URLS]
+        else:
+            ecephys_session_folders = [
+                p for p in data_folder.iterdir() if "ecephys" in p.name.lower() or "behavior" in p.name.lower()
+            ]
         if len(ecephys_session_folders) == 0:
             raise Exception("No valid ecephys sessions found.")
         elif len(ecephys_session_folders) > 1:
@@ -223,13 +289,13 @@ if __name__ == "__main__":
         subject_json = ecephys_session_folder / "subject.json"
         subject_id = "undefined"
         if subject_json.is_file():
-            subject_data = json.load(open(subject_json, "r"))
+            subject_data = json.load(subject_json.open("r"))
             subject_id = subject_data["subject_id"]
 
         data_description_json = ecephys_session_folder / "data_description.json"
         session_name = "undefined"
         if data_description_json.is_file():
-            data_description = json.load(open(data_description_json, "r"))
+            data_description = json.load(data_description_json.open("r"))
             session_name = data_description["name"]
 
         log.setup_logging(
@@ -250,6 +316,8 @@ if __name__ == "__main__":
     logging.info(f"\tMULTI SESSION: {MULTI_SESSION}")
     logging.info(f"\tINPUT: {INPUT}")
     logging.info(f"\tMIN_RECORDING_DURATION: {MIN_RECORDING_DURATION}")
+    if ECEPHYS_URLS:
+        logging.info(f"\tECEPHYS_URLS: {ECEPHYS_URLS}")
     if INPUT == "spikeinterface":
         logging.info(f"\tSPIKEINTERFACE_INFO: {spikeinterface_info}")
 
@@ -260,7 +328,7 @@ if __name__ == "__main__":
         for ecephys_session_folder in ecephys_session_folders:
             session_name = None
             if (ecephys_session_folder / "data_description.json").is_file():
-                data_description = json.load(open(ecephys_session_folder / "data_description.json", "r"))
+                data_description = json.load((ecephys_session_folder / "data_description.json").open("r"))
                 session_name = data_description["name"]
 
             # in the AIND pipeline, the session folder is mapped to
@@ -299,7 +367,7 @@ if __name__ == "__main__":
                 )
                 if is_ap_stream:
                     recording_name = f"{full_stream_name}_recording"
-                    recording = si.read_zarr(zarr_path)
+                    recording = si.read_zarr(str(zarr_path))
 
                     # Fix probe information in case of missing names
                     updated_probe = None
@@ -319,9 +387,8 @@ if __name__ == "__main__":
                                 settings_name = "settings.xml"
                             else:
                                 settings_name = f"settings_{experiment_number}.xml"
-                            updated_probe = pi.read_openephys(
-                                record_node_folder / settings_name,
-                                stream_name=openephys_stream_name
+                            updated_probe = read_openephys_probe(
+                                record_node_folder / settings_name, openephys_stream_name
                             )
                             # TODO: remove in v0.105.0 since probe is dumped in dict by default
                             recording.set_probe(updated_probe, in_place=True)
@@ -329,14 +396,18 @@ if __name__ == "__main__":
                             include_annotations = True
 
                     recording_dict[(session_name, recording_name)] = {}
-                    recording_dict[(session_name, recording_name)]["input_folder"] = ecephys_session_folder
+                    recording_dict[(session_name, recording_name)]["input_folder"] = (
+                        data_folder / STAGED_SESSION_NAME if ECEPHYS_URLS else ecephys_session_folder
+                    )
+                    if ECEPHYS_URLS:
+                        recording_dict[(session_name, recording_name)]["session_url"] = str(ecephys_session_folder)
                     recording_dict[(session_name, recording_name)]["raw"] = recording
 
                     # load the associated LF stream (if available)
                     if "AP" in openephys_stream_name:
                         lf_stream_name = full_stream_name.replace("AP", "LFP")
                         try:
-                            recording_lf = si.read_zarr(ecephys_compressed_folder / f"{lf_stream_name}.zarr")
+                            recording_lf = si.read_zarr(str(ecephys_compressed_folder / f"{lf_stream_name}.zarr"))
                             if updated_probe is not None:
                                 recording_lf.set_probe(updated_probe, in_place=True)
                             recording_dict[(session_name, recording_name)]["lfp"] = recording_lf
@@ -674,6 +745,13 @@ if __name__ == "__main__":
         recording = recording_dict[session_recording_name]["raw"]
         recording_lfp = recording_dict[session_recording_name].get("lfp", None)
         probe = recording_dict[session_recording_name].get("probe", None)
+        session_url = recording_dict[session_recording_name].get("session_url")
+
+        def serialize(rec: si.BaseRecording, include_annotations: bool = False) -> dict:
+            if session_url is not None:
+                return to_staged_dict(rec, session_url, include_annotations=include_annotations)
+            return rec.to_dict(recursive=True, include_annotations=include_annotations, relative_to=data_folder)
+
 
         if MIN_RECORDING_DURATION != -1:
             duration = recording.get_total_duration()
@@ -790,9 +868,7 @@ if __name__ == "__main__":
                 job_dict = dict(
                     session_name=session_name,
                     recording_name=str(recording_name_group),
-                    recording_dict=recording_group.to_dict(
-                        recursive=True, include_annotations=include_annotations, relative_to=data_folder
-                    ),
+                    recording_dict=serialize(recording_group, include_annotations=include_annotations),
                     skip_times=skip_times,
                     duration=duration,
                     input_folder=input_folder,
@@ -803,9 +879,7 @@ if __name__ == "__main__":
                     f"Num. channels: {recording_group.get_num_channels()}"
                 )
                 if group_name in groups_lfp:
-                    job_dict["recording_lfp_dict"] = groups_lfp[group_name].to_dict(
-                        recursive=True, relative_to=data_folder
-                    )
+                    job_dict["recording_lfp_dict"] = serialize(groups_lfp[group_name])
                     rec_str += f" (with LFP stream)"
                 if HAS_EXTRA_PROBE:
                     # Here we save the whole probe, since we only need it post-aggregation
