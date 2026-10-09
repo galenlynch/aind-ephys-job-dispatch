@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -Exeuo pipefail
 
-# Nextflow's task wrapper samples resources with ps
-apt-get update
-apt-get install -y --no-install-recommends procps
-rm -rf /var/lib/apt/lists/*
-
 uv pip install --no-cache \
     aind-log-utils==0.2.3 \
     hdmf-zarr==0.13.0 \
